@@ -1,0 +1,6 @@
+redis
+wallex
+nice_crud
+python-binance
+python-dotenv
+retry
