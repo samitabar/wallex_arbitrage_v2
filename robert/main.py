@@ -10,184 +10,34 @@ from wallex import Wallex
 from binance import Client
 
 
-from .. import nice_redis
+from . import nice_redis
 
-from ..constants.redis_constants import BINANCE_PRICES_REDIS_CONSTANTS
-from ..constants.redis_constants import WALLEX_ORDERBOOK_REDIS_CONSTANTS
-from ..constants.redis_constants import BINANCE_BALANCES_REDIS_CONSTANTS
-from ..constants.redis_constants import WALLEX_BALANCES_REDIS_CONSTANTS
+from .constants.redis_constants import BINANCE_PRICES_REDIS_CONSTANTS
+from .constants.redis_constants import WALLEX_ORDERBOOK_REDIS_CONSTANTS
+from .constants.redis_constants import BINANCE_BALANCES_REDIS_CONSTANTS
+from .constants.redis_constants import WALLEX_BALANCES_REDIS_CONSTANTS
 
-from ..helpers import offline as offline_helper
-from ..helpers import online as online_helper
-from ..helpers.models import WallexOrder, BinancePaths
+from .helpers import offline as offline_helper
+from .helpers import online as online_helper
+from .helpers.models import WallexOrder, BinancePaths
 
-from ..exceptions import DeciderException
+from .exceptions import DeciderException
 
-from ..cachers import WallexInfoCacher, BinanceInfoCacher
-
-
-class AfterOrder:
-    def __init__(self, wl: Wallex, order_results: t.List, run_thread: bool = False) -> None:
-        self.__wl = wl
-
-        if run_thread:
-            Thread(
-                target=self.__main__,
-                args=(order_results,),
-            ).start()
-        else:
-            self.__main__(order_results)
-
-    def __main__(self, order_results) -> None:
-        active_orders = self.order_decider(order_results)
-
-        if active_orders and len(active_orders) > 0:
-            self.order_decider(active_orders)
-
-    @staticmethod
-    def order_decider(order_results: t.List) -> t.List:
-        _ = []
-
-        for order in order_results:
-            if order.get('active'):
-                _.append(order)
-
-        return _
-
-    def order_marketer(self, order_results: t.List[t.Dict[t.Text, t.Any]]) -> None:
-        m = 60
-        time.sleep(5 * m)
-
-        for order in order_results:
-            recheck = self.__wl.get_order_by_id(
-                str(order.get('clientOrderId')),
-            )
-
-            if recheck.get('active'):
-                online_helper.canceler(
-                    self.__wl,
-                    order.get('clientOrderId'),
-                )
-
-                amount = offline_helper.calculate_remaining_amount(order)
-
-                try:
-                    market = self.__wl.create_order(
-                        symbol=recheck.get('symbol').lower(),
-                        side=recheck.get('side').lower(),
-                        type_='market',
-                        quantity=str(amount),
-                        price='1',
-                    )
-
-                except Exception as exx:
-                    print(exx)
-                    return
-
-                try:
-                    loss = offline_helper.calculate_loss(recheck, market)
-                except Exception as exx:
-                    print(exx)
-
-
-class AfterArbitrageHandler:
-    def __init__(
-            self, wl: Wallex, binance: Client,
-            order_results: t.List[t.Union[t.Dict, None]], revert_on_exception: bool = True
-    ) -> None:
-        self.__wl = wl
-        self.__binance = binance
-        self.order_results = order_results
-        self.revert_on_exception = revert_on_exception
-
-        self.__BINANCE_EXCHANGE = 'wallex'
-        self.__WALLEX_EXCHANGE = 'wallex'
-
-        self.__SELL = 'sell'
-        self.__BUY = 'buy'
-
-        self.__main__()
-
-    def _cancel_active(self, order: t.Dict) -> t.Union[t.Dict, bool]:
-        if order.get('active'):
-            _ = online_helper.canceler(
-                self.__wl,
-                order.get('clientOrderId'),
-            )
-            return _
-
-        return False
-
-    def _revert_side(self, order: t.Dict) -> t.Text:
-        if order.get('side').lower() == self.__SELL:
-            return self.__BUY
-        elif order.get('side').lower() == self.__BUY:
-            return self.__SELL
-
-    def _get_exchange_from_order(self, order: t.Dict) -> t.Text:
-        if 'timeInForce' in order.keys():
-            return self.__BINANCE_EXCHANGE
-        else:
-            return self.__WALLEX_EXCHANGE
-
-    def revert_wallex_order(self, order: t.Dict) -> None:
-        self._cancel_active(order)
-
-        reverted_side = self._revert_side(order)
-
-        market = self.__wl.create_order(
-            symbol=order.get('symbol').lower(),
-            side=reverted_side,
-            type_='market',
-            quantity=str(offline_helper.calculate_remaining_amount(order)),
-            price='1',
-        )
-
-    def _revert_binance_order(self, order: t.Dict) -> t.Dict:
-        reverted_side = self._revert_side(order)
-
-        if reverted_side == self.__SELL:
-            _ = self.__binance.order_market_sell(
-                symbol=order.get('symbol').lower(),
-                quantity=str(order.get('executedQty')),
-            )
-        elif reverted_side == self.__BUY:
-            _ = self.__binance.order_market_buy(
-                symbol=order.get('symbol').lower(),
-                quantity=str(order.get('executedQty')),
-            )
-        else:
-            raise Exception('Unknown side')
-
-        return _
-
-    def _revert_order(self, order: t.Dict) -> None:
-        exchange = self._get_exchange_from_order(order)
-
-        if exchange == self.__BINANCE_EXCHANGE:
-            self._revert_binance_order(order)
-        else:
-            self.revert_wallex_order(order)
-
-    def __main__(self) -> None:
-        if self.revert_on_exception:
-            if not all(self.order_results):
-                for order in self.order_results:
-                    if order is not None:
-                        self._revert_order(order)
-            else:
-                print('All executed')
-
-        else:
-            AfterOrder(self.__wl, self.order_results)
+from .cachers import WallexInfoCacher, BinanceInfoCacher
 
 
 class Main:
+    __buys_sells_type = t.Dict[t.Any, t.Dict[str, t.Union[float, t.Any]]]
+    __calc_data_type = t.Tuple[
+        __buys_sells_type,
+        __buys_sells_type
+    ]
+
     def __init__(self, wallex_token: str, binance_api_key: str, binance_api_secret: str,
                  symbols: t.List, fee: t.Union[float, int] = 0.01,
                  threaded_place_order: bool = False, revert_on_exception: bool = False,
                  add_coin_after_time: int = 60, max_workers: int = 10,
-                 sleep_time: int = 2, expire_time: int = 5, logger: bool = False) -> None:
+                 sleep_time: t.Union[float, int] = 2, expire_time: int = 5, logger: bool = False) -> None:
 
         self.__binance_price_redis = nice_redis.BinancePrices(**BINANCE_PRICES_REDIS_CONSTANTS.to_dict())
         self.__wallex_orderbook_redis = nice_redis.Orderbook(**WALLEX_ORDERBOOK_REDIS_CONSTANTS.to_dict())
@@ -230,7 +80,7 @@ class Main:
             if coin not in self.__symbols:
                 self.__symbols.append(coin.upper() + "TMN")
 
-    def main(self) -> bool:
+    def calculate_data(self) -> __calc_data_type:
         buys = {}
         sells = {}
 
@@ -257,6 +107,9 @@ class Main:
             }
             sells.update({symbol: data})
 
+        return buys, sells
+
+    def arbitrage_checker(self, buys: __buys_sells_type, sells: __buys_sells_type) -> bool:
         # sort buys by wallex price
         buys = dict(sorted(buys.items(), key=lambda x: x[1].get('usdt_price'), reverse=True))
         sells = dict(sorted(sells.items(), key=lambda x: x[1].get('usdt_price')))
@@ -455,7 +308,7 @@ class Main:
             if three is not None:
                 three = three.result()
 
-        AfterArbitrageHandler(self.__wl, self.__binance, [one, two, three], revert_on_exception)
+        online_helper.AfterArbitrageHandler(self.__wl, self.__binance, [one, two, three], revert_on_exception)
 
     def _buy_sell_sell_arbitrage(
             self,
@@ -606,7 +459,7 @@ class Main:
             if three is not None:
                 three = three.result()
 
-        AfterArbitrageHandler(self.__wl, self.__binance, [one, two, three], revert_on_exception)
+        online_helper.AfterArbitrageHandler(self.__wl, self.__binance, [one, two, three], revert_on_exception)
 
     def _two_chain_arbitrage(
             self,
@@ -764,7 +617,7 @@ class Main:
             if four is not None:
                 four = four.result()
 
-        AfterArbitrageHandler(self.__wl, self.__binance, [one, two, three, four], revert_on_exception)
+        online_helper.AfterArbitrageHandler(self.__wl, self.__binance, [one, two, three, four], revert_on_exception)
 
     def _same_coin_arbitrage(self):
         if self.__logger:
@@ -809,6 +662,13 @@ class Main:
             return tmn_balance, wallex_balance, binance_coin_balance, binance_usdt_balance
 
         return tmn_balance, wallex_balance, binance_coin_balance
+
+    def main(self):
+        if self.__logger:
+            print('Starting Arbitrage')
+
+        buys, sells = self.calculate_data()
+        __ = self.arbitrage_checker(buys, sells)
 
     def run(self) -> None:
         while True:

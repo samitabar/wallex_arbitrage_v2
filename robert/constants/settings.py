@@ -5,13 +5,13 @@ LOSS_COUNT_LIMIT = 5
 LOSS_LIMIT = 150000
 
 
-# ------------------------------ [MAIN APP TOKEN] ------------------------------ #
-EMAIL = 'robert.wallex@gmail.com'
-PASSWORD = 'Mohsen1999'
-TOKEN = '479628|zzxYQ1MjXELf89ZF45DH1x3lS5YpfQ6Ph0H0g63X'
+# ------------------------------ [MAIN APP WALLEX_TOKEN] ------------------------------ #
+WALLEX_EMAIL = 'robert.wallex@gmail.com'
+WALLEX_PASSWORD = 'Mohsen1999'
+WALLEX_TOKEN = '479628|zzxYQ1MjXELf89ZF45DH1x3lS5YpfQ6Ph0H0g63X'
 
-API_KEY = 'HE1AWZOSgHxFVX8XJzdwalbVSzAnumcvNaIRAHzoILbc3ygMqytCF9kavsUlLlXY'
-API_SECRET = 'mSkMjRH0SIIKoZimrh3If4DJPrZYFnlVWjdzEmDK14a213oTL0TqM2epxHhigquU'
+BINANCE_API_KEY = 'HE1AWZOSgHxFVX8XJzdwalbVSzAnumcvNaIRAHzoILbc3ygMqytCF9kavsUlLlXY'
+BINANCE_API_SECRET = 'mSkMjRH0SIIKoZimrh3If4DJPrZYFnlVWjdzEmDK14a213oTL0TqM2epxHhigquU'
 
 
 # ------------------------------ [NICE LOGGER CONFIG] ------------------------------ #
