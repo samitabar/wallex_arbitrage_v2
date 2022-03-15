@@ -10,13 +10,13 @@ class WallexOrder:
             self, order: t.Dict[str, t.Union[str, int, float]],
             symbol: str = None, binance_price: float = 0, tether_price: int = 0,
     ):
-        self.price = round((float(float(order.get("price")))), PRICE_ROUND_POINTS.get(symbol, 8))
-        self.quantity = round((float(order.get("quantity"))), QTY_ROUND_POINTS.get(symbol, 8))
-        self.volume = round((float(self.price * self.quantity)), PRICE_ROUND_POINTS.get(symbol, 8))
-        self.symbol = symbol.upper()
-        self.binance_price = float(binance_price)
-        self.tether_price = int(tether_price)
-        self.volume_in_usdt = self.volume / self.tether_price if self.tether_price != 0 else 0
+        self.price: float = round((float(float(order.get("price")))), PRICE_ROUND_POINTS.get(symbol, 8))
+        self.quantity: float = round((float(order.get("quantity"))), QTY_ROUND_POINTS.get(symbol, 8))
+        self.volume: float = round((float(self.price * self.quantity)), PRICE_ROUND_POINTS.get(symbol, 8))
+        self.symbol: str = symbol.upper()
+        self.binance_price: float = float(binance_price)
+        self.tether_price: int = int(tether_price)
+        self.volume_in_usdt: float = self.volume / self.tether_price if self.tether_price != 0 else 0
 
     def to_dict(self) -> t.Dict[str, t.Any]:
         return {'price': self.price, 'quantity': self.quantity, 'volume': self.volume}

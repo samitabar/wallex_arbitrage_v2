@@ -2,14 +2,13 @@ import typing as t
 import time
 
 from threading import Thread
+from concurrent.futures import ThreadPoolExecutor
 
 from traceback import print_exc as pe
 
 from wallex import Wallex
 from binance import Client
 
-
-from ..helpers.models import WallexOrder, BinancePaths
 
 from .. import nice_redis
 
@@ -18,11 +17,9 @@ from ..constants.redis_constants import WALLEX_ORDERBOOK_REDIS_CONSTANTS
 from ..constants.redis_constants import BINANCE_BALANCES_REDIS_CONSTANTS
 from ..constants.redis_constants import WALLEX_BALANCES_REDIS_CONSTANTS
 
-
-from ..constants.symbol_constants import *
-
 from ..helpers import offline as offline_helper
 from ..helpers import online as online_helper
+from ..helpers.models import WallexOrder, BinancePaths
 
 from ..exceptions import DeciderException
 
@@ -189,8 +186,9 @@ class AfterArbitrageHandler:
 
 class Main:
     def __init__(self, wallex_token: str, binance_api_key: str, binance_api_secret: str,
-                 fee: t.Union[float, int] = 0.01,
+                 symbols: t.List, fee: t.Union[float, int] = 0.01,
                  threaded_place_order: bool = False, revert_on_exception: bool = False,
+                 add_coin_after_time: int = 60, max_workers: int = 10,
                  sleep_time: int = 2, expire_time: int = 5, logger: bool = False) -> None:
 
         self.__binance_price_redis = nice_redis.BinancePrices(**BINANCE_PRICES_REDIS_CONSTANTS.to_dict())
@@ -206,18 +204,39 @@ class Main:
         self.__wl = Wallex(self.__wallex_token)
         self.__binance = Client(self.__binance_api_key, self.__binance_api_secret)
 
+        self.__symbols = symbols
         self.__fee = fee
         self.__threaded_place_order = threaded_place_order
         self.__revert_on_exception = revert_on_exception
+        self.__add_coin_after_time = add_coin_after_time
+        self.__max_workers = max_workers
         self.__sleep_time = sleep_time
         self.__expire_time = expire_time
         self.__logger = logger
+
+    def _get_executor(self, max_workers: int = None, thread_name_prefix: str = '') -> ThreadPoolExecutor:
+        if max_workers is None:
+            max_workers = self.__max_workers
+        return ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
+
+    def _handle_insufficient_funds(self, symbol: str, exchange: str) -> None:
+        coin = offline_helper.coin_name(symbol).upper() + 'TMN'
+
+        if (exchange.lower() == 'binance' and coin != 'USDTTMN ') or \
+                (exchange.lower() == 'wallex' and coin != 'TMNTMN'):
+            if coin in self.__symbols:
+                self.__symbols.remove(coin.upper() + "TMN")
+
+            time.sleep(self.__sleep_time)
+
+            if coin not in self.__symbols:
+                self.__symbols.append(coin.upper() + "TMN")
 
     def main(self) -> bool:
         buys = {}
         sells = {}
 
-        for symbol in WALLEX_SYMBOLS:
+        for symbol in self.__symbols.copy():
             orderbook = self.__wallex_orderbook_redis.read__orderbook(symbol)
             orderbook = offline_helper.filter_orderbook(orderbook, 300000)
             coin_name = offline_helper.coin_name(symbol) + 'USDT'
@@ -272,14 +291,12 @@ class Main:
 
         elif arbitrage_path == BinancePaths.BuySellSell:
             if high_to_low_percentage >= self.__fee:
-                return False
-                # return self._buy_sell_sell_arbitrage(highest_buy_order, lowest_sell_order)
+                return self._buy_sell_sell_arbitrage(highest_buy_order, lowest_sell_order)
             return False
 
         elif arbitrage_path == BinancePaths.TwoChain:
             if high_to_low_percentage >= self.__fee * 2:
-                return False
-                # return self._two_chain_arbitrage(highest_buy_order, lowest_sell_order)
+                return self._two_chain_arbitrage(highest_buy_order, lowest_sell_order)
             return False
 
         elif arbitrage_path == BinancePaths.SameCoin:
@@ -314,7 +331,7 @@ class Main:
                 highest_buy_order,
             )
 
-        wallex_tmn_balance, binance_coin_balance, wallex_coin_balance = self._find_balances(
+        wallex_tmn_balance, wallex_coin_balance, binance_coin_balance = self._find_balances(
             wallex_coin=offline_helper.coin_name(highest_buy_order.symbol),
             binance_coin_one=binance_dst.upper(),
         )
@@ -330,46 +347,113 @@ class Main:
               f'{highest_buy_quantity_for_arbitrage=} \n{lowest_sell_quantity_for_arbitrage=} \n')
         print(f'----------------------------------')
 
+        # Check for balances
+
         if wallex_tmn_balance < lowest_sell_quantity_for_arbitrage * lowest_sell_order.price:
-            return False
-        if binance_coin_balance < highest_buy_quantity_for_arbitrage * binance_rate:
-            return False
-        if wallex_coin_balance < highest_buy_quantity_for_arbitrage:
+            Thread(
+                target=self._handle_insufficient_funds,
+                args=('TMN', 'wallex')
+            ).start()
             return False
 
+        if binance_coin_balance < highest_buy_quantity_for_arbitrage * binance_rate:
+            Thread(
+                target=self._handle_insufficient_funds,
+                args=(binance_dst.upper(), 'binance')
+            ).start()
+            return False
+
+        if wallex_coin_balance < highest_buy_quantity_for_arbitrage:
+            Thread(
+                target=self._handle_insufficient_funds,
+                args=(offline_helper.coin_name(highest_buy_order.symbol), 'wallex')
+            ).start()
+            return False
+
+        # Check for threaded
+
+        if threaded is True:
+            executor = self._get_executor(3, 'BuyBuySell')
+        else:
+            executor = None
+
+        # place orders
+
         try:
-            one = self.__wl.create_order(
-                symbol=lowest_sell_order.symbol,
-                side='buy',
-                type_='limit',
-                quantity=str(round(lowest_sell_quantity_for_arbitrage, QTY_ROUND_POINTS.get(lowest_sell_order.symbol))),
-                price=str(round(lowest_sell_order.price, PRICE_ROUND_POINTS.get(lowest_sell_order.symbol)))
-            )
+            if threaded is True and executor is not None:
+                one = executor.submit(
+                    self.__wl.create_order,
+                    symbol=lowest_sell_order.symbol,
+                    side='buy',
+                    type_='limit',
+                    quantity=str(
+                        round(lowest_sell_quantity_for_arbitrage, QTY_ROUND_POINTS.get(lowest_sell_order.symbol))),
+                    price=str(round(lowest_sell_order.price, PRICE_ROUND_POINTS.get(lowest_sell_order.symbol)))
+                )
+            else:
+                one = self.__wl.create_order(
+                    symbol=lowest_sell_order.symbol,
+                    side='buy',
+                    type_='limit',
+                    quantity=str(
+                        round(lowest_sell_quantity_for_arbitrage, QTY_ROUND_POINTS.get(lowest_sell_order.symbol))
+                    ),
+                    price=str(round(lowest_sell_order.price, PRICE_ROUND_POINTS.get(lowest_sell_order.symbol)))
+                )
         except Exception as e:
             print(f'{e=}')
             one = None
 
         try:
-            three = self.__wl.create_order(
-                symbol=highest_buy_order.symbol,
-                side='sell',
-                type_='limit',
-                quantity=str(round(highest_buy_quantity_for_arbitrage, QTY_ROUND_POINTS.get(highest_buy_order.symbol))),
-                price=str(round(highest_buy_order.price, PRICE_ROUND_POINTS.get(highest_buy_order.symbol)))
-            )
+            if threaded is True and executor is not None:
+                three = executor.submit(
+                    self.__binance.create_order,
+                    symbol=highest_buy_order.symbol,
+                    side='sell',
+                    type_='limit',
+                    quantity=str(
+                        round(highest_buy_quantity_for_arbitrage, QTY_ROUND_POINTS.get(highest_buy_order.symbol))),
+                    price=str(round(highest_buy_order.price, PRICE_ROUND_POINTS.get(highest_buy_order.symbol)))
+                )
+            else:
+                three = self.__wl.create_order(
+                    symbol=highest_buy_order.symbol,
+                    side='sell',
+                    type_='limit',
+                    quantity=str(round(highest_buy_quantity_for_arbitrage, QTY_ROUND_POINTS.get(highest_buy_order.symbol))),
+                    price=str(round(highest_buy_order.price, PRICE_ROUND_POINTS.get(highest_buy_order.symbol)))
+                )
         except Exception as e:
             print(f'{e=}')
             three = None
 
         try:
-            two = self.__binance.order_market_buy(
-                symbol=binance_symbol,
-                # quantity=str(round(highest_buy_quantity_for_arbitrage, get_step_size(binance_symbol)))
-                quantity=str(round(highest_buy_quantity_for_arbitrage, 8))
-            )
+            if threaded is True and executor is not None:
+                two = executor.submit(
+                    self.__binance.order_market_buy,
+                    symbol=binance_symbol,
+                    # TODO FIX THIS
+                    # quantity=str(round(highest_buy_quantity_for_arbitrage, get_step_size(binance_symbol)))
+                    quantity=str(round(highest_buy_quantity_for_arbitrage, 8))
+                )
+            else:
+                two = self.__binance.order_market_buy(
+                    symbol=binance_symbol,
+                    # TODO FIX THIS
+                    # quantity=str(round(highest_buy_quantity_for_arbitrage, get_step_size(binance_symbol)))
+                    quantity=str(round(highest_buy_quantity_for_arbitrage, 8))
+                )
         except Exception as e:
             print(f'{e=}')
             two = None
+
+        if threaded is True and executor is not None:
+            if one is not None:
+                one = one.result()
+            if two is not None:
+                two = two.result()
+            if three is not None:
+                three = three.result()
 
         AfterArbitrageHandler(self.__wl, self.__binance, [one, two, three], revert_on_exception)
 
@@ -399,7 +483,7 @@ class Main:
                 highest_buy_order,
             )
 
-        wallex_tmn_balance, binance_coin_balance, wallex_coin_balance = self._find_balances(
+        wallex_tmn_balance, wallex_coin_balance, binance_coin_balance = self._find_balances(
             wallex_coin=offline_helper.coin_name(highest_buy_order.symbol),
             binance_coin_one=binance_src.upper(),
         )
@@ -416,51 +500,281 @@ class Main:
         print(f'----------------------------------')
 
         if wallex_tmn_balance < lowest_sell_quantity_for_arbitrage * lowest_sell_order.price:
+            Thread(
+                target=self._handle_insufficient_funds,
+                args=('TMN', 'wallex')
+            ).start()
             return False
         if binance_coin_balance < highest_buy_quantity_for_arbitrage * binance_rate:
+            Thread(
+                target=self._handle_insufficient_funds,
+                args=(binance_src.upper(), 'binance')
+            ).start()
             return False
         if wallex_coin_balance < highest_buy_quantity_for_arbitrage:
+            Thread(
+                target=self._handle_insufficient_funds,
+                args=(offline_helper.coin_name(highest_buy_order.symbol), 'wallex')
+            ).start()
             return False
 
+        # Check for threaded
+
+        if threaded is True:
+            executor = self._get_executor(3, 'BuySellSell')
+        else:
+            executor = None
+
+        # place orders
+
         try:
-            one = self.__wl.create_order(
-                symbol=lowest_sell_order.symbol,
-                side='buy',
-                type_='limit',
-                quantity=str(round(lowest_sell_quantity_for_arbitrage, QTY_ROUND_POINTS.get(lowest_sell_order.symbol))),
-                price=str(round(lowest_sell_order.price, PRICE_ROUND_POINTS.get(lowest_sell_order.symbol)))
-            )
+            if threaded is True and executor is not None:
+                one = executor.submit(
+                    self.__wl.create_order,
+                    symbol=lowest_sell_order.symbol,
+                    side='buy',
+                    type_='limit',
+                    quantity=str(
+                        round(lowest_sell_quantity_for_arbitrage, QTY_ROUND_POINTS.get(lowest_sell_order.symbol))),
+                    price=str(round(lowest_sell_order.price, PRICE_ROUND_POINTS.get(lowest_sell_order.symbol)))
+                )
+            else:
+                one = self.__wl.create_order(
+                    symbol=lowest_sell_order.symbol,
+                    side='buy',
+                    type_='limit',
+                    quantity=str(
+                        round(lowest_sell_quantity_for_arbitrage, QTY_ROUND_POINTS.get(lowest_sell_order.symbol))),
+                    price=str(round(lowest_sell_order.price, PRICE_ROUND_POINTS.get(lowest_sell_order.symbol)))
+                )
         except Exception as e:
             print(f'{e=}')
             one = None
 
         try:
-            three = self.__wl.create_order(
-                symbol=highest_buy_order.symbol,
-                side='sell',
-                type_='limit',
-                quantity=str(round(highest_buy_quantity_for_arbitrage, QTY_ROUND_POINTS.get(highest_buy_order.symbol))),
-                price=str(round(highest_buy_order.price, PRICE_ROUND_POINTS.get(highest_buy_order.symbol)))
-            )
+            if threaded is True and executor is not None:
+                three = executor.submit(
+                    self.__binance.create_order,
+                    symbol=highest_buy_order.symbol,
+                    side='sell',
+                    type_='limit',
+                    quantity=str(
+                        round(highest_buy_quantity_for_arbitrage, QTY_ROUND_POINTS.get(highest_buy_order.symbol))),
+                    price=str(round(highest_buy_order.price, PRICE_ROUND_POINTS.get(highest_buy_order.symbol)))
+                )
+            else:
+                three = self.__wl.create_order(
+                    symbol=highest_buy_order.symbol,
+                    side='sell',
+                    type_='limit',
+                    quantity=str(
+                        round(highest_buy_quantity_for_arbitrage, QTY_ROUND_POINTS.get(highest_buy_order.symbol))),
+                    price=str(round(highest_buy_order.price, PRICE_ROUND_POINTS.get(highest_buy_order.symbol)))
+                )
         except Exception as e:
             print(f'{e=}')
             three = None
 
         try:
-            two = self.__binance.order_market_buy(
-                symbol=binance_symbol,
-                # TODO CHANGE THIS
-                # quantity=str(round(highest_buy_quantity_for_arbitrage, get_step_size(binance_symbol)))
-                quantity=str(round(highest_buy_quantity_for_arbitrage, 8))
-            )
+            if threaded is True and executor is not None:
+                two = executor.submit(
+                    self.__binance.order_market_sell,
+                    symbol=binance_symbol,
+                    # TODO CHANGE THIS
+                    # quantity=str(round(highest_buy_quantity_for_arbitrage, get_step_size(binance_symbol)))
+                    quantity=str(round(highest_buy_quantity_for_arbitrage, 8))
+                )
+            else:
+                two = self.__binance.order_market_sell(
+                    symbol=binance_symbol,
+                    # TODO CHANGE THIS
+                    # quantity=str(round(highest_buy_quantity_for_arbitrage, get_step_size(binance_symbol)))
+                    quantity=str(round(highest_buy_quantity_for_arbitrage, 8))
+                )
         except Exception as e:
             print(f'{e=}')
             two = None
 
+        if threaded is True and executor is not None:
+            if one is not None:
+                one = one.result()
+            if two is not None:
+                two = two.result()
+            if three is not None:
+                three = three.result()
+
         AfterArbitrageHandler(self.__wl, self.__binance, [one, two, three], revert_on_exception)
 
-    def _two_chain_arbitrage(self, high_to_low_percentage: float):
-        return False
+    def _two_chain_arbitrage(
+            self,
+            highest_buy_order: WallexOrder,
+            lowest_sell_order: WallexOrder,
+            threaded: bool = False,
+            revert_on_exception: bool = False
+    ):
+
+        base_lowest_quantity_in_usdt = min(highest_buy_order.volume_in_usdt, lowest_sell_order.volume_in_usdt)
+        highest_buy_quantity_for_arbitrage = base_lowest_quantity_in_usdt / highest_buy_order.binance_price
+        lowest_sell_quantity_for_arbitrage = base_lowest_quantity_in_usdt / lowest_sell_order.binance_price
+
+        wallex_tmn_balance, wallex_coin_balance, binance_coin_balance_one, binance_usdt_balance = \
+            self._find_balances(
+                wallex_coin=offline_helper.coin_name(highest_buy_order.symbol),
+                binance_coin_one=offline_helper.coin_name(lowest_sell_order.symbol),
+                binance_usdt=True
+            )
+
+        if wallex_tmn_balance < lowest_sell_quantity_for_arbitrage * lowest_sell_order.price:
+            Thread(
+                target=self._handle_insufficient_funds,
+                args=('TMN', 'wallex')
+            ).start()
+            return False
+
+        if binance_coin_balance_one < lowest_sell_quantity_for_arbitrage:
+            Thread(
+                target=self._handle_insufficient_funds,
+                args=(offline_helper.coin_name(lowest_sell_order.symbol), 'binance')
+            ).start()
+            return False
+
+        if wallex_coin_balance < highest_buy_quantity_for_arbitrage:
+            Thread(
+                target=self._handle_insufficient_funds,
+                args=(offline_helper.coin_name(highest_buy_order.symbol), 'wallex')
+            ).start()
+            return False
+
+        if binance_usdt_balance < highest_buy_quantity_for_arbitrage:
+            Thread(
+                target=self._handle_insufficient_funds,
+                args=('USDT', 'binance')
+            ).start()
+            return False
+
+        # Check for threaded
+
+        if threaded is True:
+            executor = self._get_executor(3, 'TwoChain')
+        else:
+            executor = None
+
+        # place orders
+
+        try:
+            if threaded is True and executor is not None:
+                one = executor.submit(
+                    self.__wl.create_order,
+                    symbol=lowest_sell_order.symbol,
+                    side='buy',
+                    type_='limit',
+                    quantity=str(
+                        round(lowest_sell_quantity_for_arbitrage, QTY_ROUND_POINTS.get(lowest_sell_order.symbol))
+                    ),
+                    price=str(round(lowest_sell_order.price, PRICE_ROUND_POINTS.get(lowest_sell_order.symbol)))
+                )
+            else:
+                one = self.__wl.create_order(
+                    symbol=lowest_sell_order.symbol,
+                    side='buy',
+                    type_='limit',
+                    quantity=str(
+                        round(lowest_sell_quantity_for_arbitrage, QTY_ROUND_POINTS.get(lowest_sell_order.symbol))
+                    ),
+                    price=str(round(lowest_sell_order.price, PRICE_ROUND_POINTS.get(lowest_sell_order.symbol)))
+                )
+        except Exception as e:
+            print(f'{e=}')
+            one = None
+
+        try:
+            if threaded is True and executor is not None:
+                four = executor.submit(
+                    self.__binance.create_order,
+                    symbol=highest_buy_order.symbol,
+                    side='sell',
+                    type_='limit',
+                    quantity=str(
+                        round(highest_buy_quantity_for_arbitrage, QTY_ROUND_POINTS.get(highest_buy_order.symbol))
+                    ),
+                    price=str(round(highest_buy_order.price, PRICE_ROUND_POINTS.get(highest_buy_order.symbol)))
+                )
+            else:
+                four = self.__wl.create_order(
+                    symbol=highest_buy_order.symbol,
+                    side='sell',
+                    type_='limit',
+                    quantity=str(
+                        round(highest_buy_quantity_for_arbitrage, QTY_ROUND_POINTS.get(highest_buy_order.symbol))
+                    ),
+                    price=str(round(highest_buy_order.price, PRICE_ROUND_POINTS.get(highest_buy_order.symbol)))
+                )
+        except Exception as e:
+            print(f'{e=}')
+            four = None
+
+        try:
+            if threaded is True and executor is not None:
+                two = executor.submit(
+                    self.__binance.order_market_sell,
+                    symbol=f'{offline_helper.coin_name(lowest_sell_order.symbol)}USDT',
+                    quantity=str(round(
+                        lowest_sell_quantity_for_arbitrage,
+                        # get_step_size(f'{offline_helper.coin_name(lowest_sell_order.symbol)}USDT')
+                        8
+                    ))
+                )
+            else:
+                two = self.__binance.order_market_sell(
+                    symbol=f'{offline_helper.coin_name(lowest_sell_order.symbol)}USDT',
+                    quantity=str(round(
+                        lowest_sell_quantity_for_arbitrage,
+                        # TODO FIX THIS
+                        # get_step_size(f'{offline_helper.coin_name(lowest_sell_order.symbol)}USDT')
+                        8
+                    ))
+                )
+        except Exception as e:
+            print(f'{e=}')
+            two = None
+
+        try:
+            if threaded is True and executor is not None:
+                three = executor.submit(
+                    self.__binance.order_market_buy,
+                    symbol=f'{offline_helper.coin_name(highest_buy_order.symbol)}USDT',
+                    quantity=str(round(
+                        highest_buy_quantity_for_arbitrage,
+                        8
+                        # TODO FIX THIS
+                        # get_step_size(f'{offline_helper.coin_name(highest_buy_order.symbol)}USDT')
+                    ))
+                )
+            else:
+                three = self.__binance.order_market_buy(
+                    symbol=f'{offline_helper.coin_name(highest_buy_order.symbol)}USDT',
+                    quantity=str(round(
+                        highest_buy_quantity_for_arbitrage,
+                        8
+                        # TODO FIX THIS
+                        # get_step_size(f'{offline_helper.coin_name(highest_buy_order.symbol)}USDT')
+                    ))
+                )
+        except Exception as e:
+            print(f'{e=}')
+            three = None
+
+        if threaded is True and executor is not None:
+            if one is not None:
+                one = one.result()
+            if two is not None:
+                two = two.result()
+            if three is not None:
+                three = three.result()
+            if four is not None:
+                four = four.result()
+
+        AfterArbitrageHandler(self.__wl, self.__binance, [one, two, three, four], revert_on_exception)
 
     def _same_coin_arbitrage(self):
         if self.__logger:
@@ -468,8 +782,23 @@ class Main:
         return False
 
     def _find_balances(
-            self, wallex_coin: str, binance_coin_one: str, binance_coin_two: str = None
+            self, wallex_coin: str, binance_coin_one: str, binance_usdt: bool = False
     ) -> t.Union[t.Tuple[float, float, float, float], t.Tuple[float, float, float]]:
+        """
+        Finds the balances of the given coin in the given exchange.
+
+        :param wallex_coin: The coin to find the balance of.
+        :type wallex_coin: str
+
+        :param binance_coin_one: The coin to find the balance of.
+        :type binance_coin_one: str
+
+        :param binance_usdt: Whether or not to find the balance of the USDT coin.
+        :type binance_usdt: bool
+
+        :return: The balances of the given coin in the given exchange.
+        :rtype: t.Union[t.Tuple[float, float, float, float], t.Tuple[float, float, float]]
+        """
 
         all_wallex_balances = self.__wallex_balances_redis.read_all_balances()
 
@@ -478,18 +807,18 @@ class Main:
             'TMN'
         )
 
-        binance_coin_balance_one = float(self.__binance_balances_redis.read_balance(binance_coin_one.upper()))
+        binance_coin_balance = float(self.__binance_balances_redis.read_balance(binance_coin_one.upper()))
 
         wallex_balance = offline_helper.find_wallex_asset_balance_offline(
             all_wallex_balances,
-            binance_coin_two
+            wallex_coin
         )
 
-        if binance_coin_two is not None:
-            binance_coin_balance_two = float(self.__binance_balances_redis.read_balance(binance_coin_two.upper()))
-            return tmn_balance, binance_coin_balance_one, binance_coin_balance_two, wallex_balance
+        if binance_usdt is True:
+            binance_usdt_balance = float(self.__binance_balances_redis.read_balance('USDT'))
+            return tmn_balance, wallex_balance, binance_coin_balance, binance_usdt_balance
 
-        return tmn_balance, wallex_balance, binance_coin_balance_one
+        return tmn_balance, wallex_balance, binance_coin_balance
 
     def run(self) -> None:
         while True:
