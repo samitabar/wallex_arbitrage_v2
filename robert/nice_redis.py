@@ -9,7 +9,9 @@ from .exceptions import *
 
 __all__ = [
     'Orderbook',
+    'BinancePrices',
     'Balances',
+    'Info',
 ]
 
 
@@ -95,3 +97,22 @@ class Balances(BaseRedis):
         if balances is None:
             raise EmptyCacheException('Balances', f'No Cache Found For {coin}', coin)
         return balances.get(coin)
+
+
+class Info(BaseRedis):
+    def __init__(self, host: str, port: int, db: int, password: str = None):
+        self.WALLEX_PRICE_ROUND_POINT = 'WALLEX_PRICE_ROUND_POINT'
+        self.WALLEX_QTY_ROUND_POINT = 'WALLEX_QTY_ROUND_POINT'
+        self.BINANCE_DATA = 'BINANCE_DATA'
+        self.WALLEX_DATA = 'WALLEX_DATA'
+
+        super().__init__(host, port, db, password)
+
+    def set_info(self, key: str, info: t.Dict) -> None:
+        self._base_cache_data(key, json.dumps(info))
+
+    def read_info(self, key: str) -> t.Union[t.Dict, None]:
+        info = self._base_read_data(key)
+        if info is None:
+            raise EmptyCacheException('Info', f'No Cache Found For {key}', key)
+        return json.loads(info)

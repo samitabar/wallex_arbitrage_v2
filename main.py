@@ -5,9 +5,17 @@ from robert import WallexOrderbookCacher
 from robert import WallexBalancesCacher
 from robert import BinancePricesCacher
 from robert import BinanceBalanceCacher
+from robert import BinanceInfoCacher
+from robert import WallexInfoCacher
 from robert import Main
-# from robert import GenerateData
 from robert import symbol_constants
+
+
+def update_cached_info(binance: bool = True, wallex: bool = True):
+    if binance is True:
+        BinanceInfoCacher()
+    if wallex is True:
+        WallexInfoCacher()
 
 
 def main():
@@ -46,6 +54,7 @@ def main():
 
 
 if __name__ == '__main__':
-    print('[Starting] \t main')
-    main()
-    print('[Finished] \t main')
+    update_cached_info()
+    # print('[Starting] \t main')
+    # main()
+    # print('[Finished] \t main')
